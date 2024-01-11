@@ -1,11 +1,16 @@
-#include <opencv4/opencv2/opencv.hpp>
+#include <opencv4/opencv2/highgui.hpp>
+#include <opencv4/opencv2/calib3d.hpp>
 #include <deque>
+#include <queue>
+
 #include "stabcv.hpp"
 
 #ifdef CUDA_STAB
 #include <opencv4/opencv2/cudafilters.hpp>
 #include <opencv4/opencv2/cudawarping.hpp>
 #include <opencv4/opencv2/cudaimgproc.hpp>
+#else
+#include <opencv4/opencv2/imgproc.hpp>
 #endif
 
 
@@ -44,6 +49,7 @@ cv::Mat stabcv::Stabilizer::compute_affine(cv::Mat &base, cv::Mat &train, bool s
     if(process_size.width == 0 || process_size.height == 0)
         resize_flag = false;
 
+    // Resize, Greyscale, and Blur the images.
 #ifdef CUDA_STAB
     cv::cuda::GpuMat base_buf, train_buf;
 
@@ -79,15 +85,11 @@ cv::Mat stabcv::Stabilizer::compute_affine(cv::Mat &base, cv::Mat &train, bool s
     cv::GaussianBlur(train_buf, train_buf, cv::Size(5, 5), 0);
 #endif
 
-    // Detect the features
+    // Detect the features and compute descriptors.
     std::vector<cv::KeyPoint> keypoints1, keypoints2;
-    orb->detect(base_buf ,keypoints1);
-    orb->detect(train_buf ,keypoints2);
-
-    // Compute BRIEF descriptors.
     cv::Mat descriptors1, descriptors2;
-    orb->compute(base_buf, keypoints1, descriptors1);
-    orb->compute(train_buf, keypoints2, descriptors2);
+    orb->detectAndCompute(base_buf, cv::noArray(), keypoints1, descriptors1);
+    orb->detectAndCompute(train_buf, cv::noArray(), keypoints2, descriptors2);
 
     // Match the features.
     std::vector<cv::DMatch> matches;
@@ -113,8 +115,8 @@ cv::Mat stabcv::Stabilizer::compute_affine(cv::Mat &base, cv::Mat &train, bool s
 
     if(show_matches) {
         cv::Mat out, base_feat, train_feat;
-        cv::drawKeypoints(base, keypoints1, base_feat);
-        cv::drawKeypoints(train, keypoints2, train_feat);
+        cv::drawKeypoints(base, keypoints1, base_feat, cv::Scalar_<double>::all(-1), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS | cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+        cv::drawKeypoints(train, keypoints2, train_feat, cv::Scalar_<double>::all(-1), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS | cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
         cv::drawMatches(
             base, 
             keypoints1, 
@@ -183,19 +185,18 @@ void stabcv::Stabilizer::compute_vid_avg(char* source, char* dest, bool liveview
     std::vector<cv::KeyPoint> prev_feat, cur_feat;
     std::vector<cv::DMatch> matches, good_matches;
     std::vector<cv::Point2f> obj, scene;
-    std::queue<cv::Mat> temp_affine_queue;
+    std::queue<Trajectory> temp_traj_queue;
     cv::Mat affine_buf, affine_avg, cur, gen;
+    Trajectory avg_traj, temp_traj;
 
     double min_dist;
     char buffer[512];
     strcpy(buffer, source);
+    input >> cur;
     while(true) {
         input >> cur;
         if(cur.data == NULL)
             break;
-
-        // cv::Rect crop(0, 15, 640, 465);
-        // cur = cur(crop);
 
 #ifdef CUDA_STAB
         cur_buf.upload(cur);
@@ -249,36 +250,47 @@ void stabcv::Stabilizer::compute_vid_avg(char* source, char* dest, bool liveview
             affine_buf = (cv::Mat_<double>(2, 3) << 1, 0, 0, 0, 1, 0);
         // std::cout << affine_buf << std::endl;
 
-        // Create the averaged affine matrix
-        if(avg_window == 0) {
-            affine_avg = affine_buf;
+        if(avg_window != 0) {
+            // Create the averaged affine matrix
+            temp_traj.x = affine_buf.at<double>(0,2);
+            temp_traj.y = affine_buf.at<double>(1,2);
+            temp_traj.a = atan2(affine_buf.at<double>(1,0), affine_buf.at<double>(0,0));
 
-        } else if(temp_affine_queue.size() >= avg_window) {
-            affine_avg += (affine_buf - temp_affine_queue.front())/(avg_window);
-            temp_affine_queue.pop();
-            temp_affine_queue.push(affine_buf);
+            if(temp_traj_queue.size() >= avg_window) {
+                // affine_avg += (affine_buf - temp_affine_queue.front())/(avg_window);
+                avg_traj += (temp_traj - temp_traj_queue.front())/avg_window;
+                temp_traj_queue.pop();
+                temp_traj_queue.push(temp_traj);
 
-        } else {
-            if(affine_avg.empty())
-                affine_avg = affine_buf/(avg_window);
-            else
-                affine_avg += affine_buf/(avg_window);
-            temp_affine_queue.push(affine_buf);
+            } else {
+                if(affine_avg.empty())
+                    avg_traj = temp_traj/(avg_window);
+                else
+                    avg_traj += temp_traj/(avg_window);
+                temp_traj_queue.push(temp_traj);
 
-            if(!fixed) {
-                cur_feat.swap(prev_feat);
-                cur_desc.copyTo(prev_desc);
+                if(!fixed) {
+                    cur_feat.swap(prev_feat);
+                    cur_desc.copyTo(prev_desc);
+                }
+                continue;
             }
-            continue;
+
+            affine_buf.at<double>(0,0) = cos(avg_traj.a);
+            affine_buf.at<double>(0,1) = -sin(avg_traj.a);
+            affine_buf.at<double>(1,0) = sin(avg_traj.a);
+            affine_buf.at<double>(1,1) = cos(avg_traj.a);
+            affine_buf.at<double>(0,2) = avg_traj.x;
+            affine_buf.at<double>(1,2) = avg_traj.y;
         }
 
         // Apply the affine matrix
 #ifdef CUDA_STAB
         cur_buf.upload(cur);
-        cv::cuda::warpAffine(cur_buf, gen_buf, affine_avg, cur_buf.size(), cv::INTER_CUBIC);
+        cv::cuda::warpAffine(cur_buf, gen_buf, affine_buf, cur_buf.size(), cv::INTER_CUBIC);
         gen_buf.download(gen);
 #else
-        cv::warpAffine(cur, gen, affine_avg, cur.size(), cv::INTER_CUBIC);
+        cv::warpAffine(cur, gen, affine_buf, cur.size(), cv::INTER_CUBIC);
 #endif
         output << gen;
 
